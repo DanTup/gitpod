@@ -8,10 +8,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,7 +111,7 @@ func (wbs *InWorkspaceServiceServer) Start() error {
 	}
 
 	limits := ratelimitingInterceptor{
-		"/iws.InWorkspaceService/MountShiftfsMark": ratelimit{
+		"/iws.InWorkspaceService/PrepareForUserNS": ratelimit{
 			UseOnce: true,
 		},
 		"/iws.InWorkspaceService/WriteIDMapping": ratelimit{
@@ -137,39 +139,62 @@ func (wbs *InWorkspaceServiceServer) Stop() {
 	wbs.srv.GracefulStop()
 }
 
-// MountShiftfsMark mounts the workspace's shiftfs mark
-func (wbs *InWorkspaceServiceServer) MountShiftfsMark(ctx context.Context, req *api.MountShiftfsMarkRequest) (resp *api.MountShiftfsMarkResponse, err error) {
+// PrepareForUserNS mounts the workspace's shiftfs mark
+func (wbs *InWorkspaceServiceServer) PrepareForUserNS(ctx context.Context, req *api.PrepareForUserNSRequest) (*api.PrepareForUserNSResponse, error) {
 	rt := wbs.Uidmapper.Runtime
 	if rt == nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "not connected to container runtime")
 	}
 	wscontainerID, err := rt.WaitForContainer(ctx, wbs.Session.InstanceID)
 	if err != nil {
-		log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountShiftfsMark: cannot find workspace container")
+		log.WithError(err).WithFields(wbs.Session.OWI()).Error("PrepareForUserNS: cannot find workspace container")
 		return nil, status.Errorf(codes.Internal, "cannot find workspace container")
 	}
 
 	rootfs, err := rt.ContainerRootfs(ctx, wscontainerID, container.OptsContainerRootfs{Unmapped: true})
 	if err != nil {
-		log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountShiftfsMark: cannot find workspace rootfs")
+		log.WithError(err).WithFields(wbs.Session.OWI()).Error("PrepareForUserNS: cannot find workspace rootfs")
+		return nil, status.Errorf(codes.Internal, "cannot find workspace rootfs")
+	}
+
+	containerPID, err := rt.ContainerPID(ctx, wscontainerID)
+	if err != nil {
+		log.WithError(err).WithFields(wbs.Session.OWI()).Error("PrepareForUserNS: cannot find workspace container PID")
 		return nil, status.Errorf(codes.Internal, "cannot find workspace rootfs")
 	}
 
 	// We cannot use the nsenter syscall here because mount namespaces affect the whole process, not just the current thread.
 	// That's why we resort to exec'ing "nsenter ... mount ...".
+	mntout, err := exec.Command("nsenter", "-t", fmt.Sprint(containerPID), "-m", "--", "mount", "--make-shared", "/").CombinedOutput()
+	if err != nil {
+		log.WithField("containerPID", containerPID).WithError(err).Error("cannot make container's rootfs shared")
+		return nil, status.Errorf(codes.Internal, "cannot make container's rootfs shared")
+	}
+
 	_ = os.MkdirAll(filepath.Join(wbs.Session.ServiceLocDaemon, "mark"), 0755)
 	mountpoint := filepath.Join(wbs.Session.ServiceLocNode, "mark")
-	mntout, err := exec.Command("nsenter", "-t", "1", "-m", "--", "mount", "-t", "shiftfs", "-o", "mark", rootfs, mountpoint).CombinedOutput()
+	mntout, err = exec.Command("nsenter", "-t", "1", "-m", "--", "mount", "-t", "shiftfs", "-o", "mark", rootfs, mountpoint).CombinedOutput()
 	if err != nil {
 		log.WithField("rootfs", rootfs).WithField("mountpoint", mountpoint).WithField("mntout", string(mntout)).WithError(err).Error("cannot mount shiftfs mark")
 		return nil, status.Errorf(codes.Internal, "cannot mount shiftfs mark")
 	}
 
-	return &api.MountShiftfsMarkResponse{}, nil
+	return &api.PrepareForUserNSResponse{}, nil
 }
 
 // MountProc mounts a proc filesystem
 func (wbs *InWorkspaceServiceServer) MountProc(ctx context.Context, req *api.MountProcRequest) (resp *api.MountProcResponse, err error) {
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		log.WithError(err).Error("MountProc failed")
+		if _, ok := status.FromError(err); !ok {
+			err = status.Error(codes.Internal, "cannot mount proc")
+		}
+	}()
+
 	pth := filepath.Clean(req.Target)
 	if !filepath.IsAbs(pth) {
 		return nil, status.Errorf(codes.InvalidArgument, "path must be absolute")
@@ -181,40 +206,64 @@ func (wbs *InWorkspaceServiceServer) MountProc(ctx context.Context, req *api.Mou
 	}
 	wscontainerID, err := rt.WaitForContainer(ctx, wbs.Session.InstanceID)
 	if err != nil {
-		log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountProc: cannot find workspace container")
-		return nil, status.Errorf(codes.Internal, "cannot find workspace container")
+		return nil, xerrors.Errorf("cannot find workspace container")
 	}
 
 	containerPID, err := rt.ContainerPID(ctx, wscontainerID)
 	if err != nil {
-		log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountProc: cannot get container PID")
-		return nil, status.Errorf(codes.Internal, "cannot find container PID")
+		return nil, xerrors.Errorf("cannot find container PID for containerID %v: %w", wscontainerID)
 	}
-
-	// rootfs, err := rt.ContainerRootfs(ctx, wscontainerID, container.OptsContainerRootfs{Unmapped: false})
-	// if err != nil {
-	// 	log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountProc: cannot find workspace rootfs")
-	// 	return nil, status.Errorf(codes.Internal, "cannot find workspace rootfs")
-	// }
 
 	procpid, err := wbs.Uidmapper.findHostPID(containerPID, uint64(req.Pid))
 	if err != nil {
-		log.WithField("containerPID", containerPID).WithError(err).Error("cannot map in-container PID")
-		return nil, status.Errorf(codes.Internal, "cannot mount proc")
+		return nil, xerrors.Errorf("cannot map in-container PID %d (container PID: %d): %w", req.Pid, containerPID)
 	}
 
-	mntout, err := exec.Command("nsenter", "-t", fmt.Sprint(procpid), "-m", "-p", "--", "mount", "-t", "tmpfs", "none", pth).CombinedOutput()
+	nodeStaging, err := ioutil.TempDir("", "proc-staging")
 	if err != nil {
-		log.WithField("mountpoint", pth).WithField("procpid", procpid).WithField("containerPID", containerPID).WithField("args", []string{"-t", fmt.Sprint(procpid), "-m", "-p", "--", "mount", "-t", "tmpfs", "none", pth}).WithField("mntout", string(mntout)).WithError(err).Error("cannot mount proc")
-		return nil, status.Errorf(codes.Internal, "cannot mount proc")
+		return nil, xerrors.Errorf("cannot prepare proc staging: %w")
+	}
+	mntout, err := exec.Command("nsenter", "-t", fmt.Sprint(procpid), "-p", "--", "mount", "-t", "proc", "proc", nodeStaging).CombinedOutput()
+	if err != nil {
+		return nil, xerrors.Errorf("mount new proc at %s: %w: %s", nodeStaging, err, string(mntout))
 	}
 
-	// mountpoint := filepath.Join(rootfs, pth)
-	// err = syscall.Mount("proc", mountpoint, "proc", 0, "")
-	// if err != nil {
-	// 	log.WithError(err).WithFields(wbs.Session.OWI()).WithField("mountpoint", mountpoint).Error("MountProc: cannot mount proc")
-	// 	return nil, status.Errorf(codes.Internal, "cannot mount proc")
+	// TODO(cw): mask proc
+	// maskedFiles := []string{
+	// 	"acpi",
+	// 	"kcore",
+	// 	"keys",
+	// 	"timer_list",
+	// 	"sched_debug",
+	// 	"scsi",
 	// }
+	// for _, mf := range maskedFiles {
+	// 	fn := filepath.Join(nodeStaging, mf)
+	// 	if _, err := os.Stat(fn); os.IsNotExist(err) {
+	// 		continue
+	// 	}
+
+	// 	err = syscall.Mount("none", fn, "tmpfs", syscall.MS_RDONLY, "")
+	// 	if err != nil {
+	// 		return nil, xerrors.Errorf("mount proc mask at %s: %w", fn, err)
+	// 	}
+	// }
+
+	containerStaging, err := ioutil.TempDir(wbs.Session.ServiceLocDaemon, "proc-staging")
+	if err != nil {
+		return nil, xerrors.Errorf("cannot prepare proc-staging for container: %w", err)
+	}
+
+	mntout, err = exec.Command("mount", "--move", nodeStaging, containerStaging).CombinedOutput()
+	if err != nil {
+		return nil, xerrors.Errorf("cannot move proc mount at %s: %w: %s", containerStaging, err, string(mntout))
+	}
+
+	workspaceStaging := filepath.Join("/.workspace", strings.TrimPrefix(containerStaging, wbs.Session.ServiceLocDaemon))
+	mntout, err = exec.Command("nsenter", "-t", fmt.Sprint(procpid), "-m", "--", "mount", "--move", workspaceStaging, pth).CombinedOutput()
+	if err != nil {
+		return nil, xerrors.Errorf("cannot move proc in workspace from %s to %s: %w: %s", workspaceStaging, pth, err, string(mntout))
+	}
 
 	return &api.MountProcResponse{}, nil
 }
@@ -249,7 +298,7 @@ func (wbs *InWorkspaceServiceServer) Teardown(ctx context.Context, req *api.Tear
 		success = false
 	}
 
-	err = wbs.unmountShiftfsMark()
+	err = wbs.unPrepareForUserNS()
 	if err != nil {
 		log.WithError(err).WithFields(owi).Error("ShiftFS unmount failed")
 		success = false
@@ -276,7 +325,7 @@ func (wbs *InWorkspaceServiceServer) performLiveBackup() error {
 	return nil
 }
 
-func (wbs *InWorkspaceServiceServer) unmountShiftfsMark() error {
+func (wbs *InWorkspaceServiceServer) unPrepareForUserNS() error {
 	if !wbs.Session.ShiftfsMarkMount {
 		return nil
 	}
